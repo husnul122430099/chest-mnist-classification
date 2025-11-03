@@ -2,11 +2,64 @@
 
 import torch
 import torch.nn as nn
+from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+
+class EfficientNetB0ChestMNIST(nn.Module):
+    """
+    EfficientNet-B0 dengan pretrained ImageNet weights
+    Dimodifikasi untuk ChestMNIST (28x28 grayscale, 2 classes)
+    Target: Val Acc > 90%
+    """
+    def __init__(self, in_channels=1, num_classes=2, pretrained=True):
+        super().__init__()
+        
+        # Load pretrained EfficientNet-B0
+        if pretrained:
+            weights = EfficientNet_B0_Weights.IMAGENET1K_V1
+            self.efficientnet = efficientnet_b0(weights=weights)
+        else:
+            self.efficientnet = efficientnet_b0(weights=None)
+        
+        # Modifikasi layer pertama untuk grayscale (1 channel)
+        # Original: Conv2d(3, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        original_first_layer = self.efficientnet.features[0][0]
+        self.efficientnet.features[0][0] = nn.Conv2d(
+            in_channels,  # 1 channel untuk grayscale
+            original_first_layer.out_channels,
+            kernel_size=original_first_layer.kernel_size,
+            stride=original_first_layer.stride,
+            padding=original_first_layer.padding,
+            bias=False
+        )
+        
+        # Jika pretrained, copy weights dari 3 channel ke 1 channel
+        if pretrained:
+            with torch.no_grad():
+                # Average RGB weights menjadi grayscale
+                self.efficientnet.features[0][0].weight = nn.Parameter(
+                    original_first_layer.weight.mean(dim=1, keepdim=True)
+                )
+        
+        # Modifikasi classifier untuk binary classification
+        # Original classifier: Linear(in_features=1280, out_features=1000)
+        in_features = self.efficientnet.classifier[1].in_features
+        
+        self.efficientnet.classifier = nn.Sequential(
+            nn.Dropout(p=0.3, inplace=True),
+            nn.Linear(in_features, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.2),
+            nn.Linear(512, 1 if num_classes == 2 else num_classes)
+        )
+    
+    def forward(self, x):
+        return self.efficientnet(x)
+
 
 class EfficientChestNet(nn.Module):
     """
-    Model CNN yang lebih dalam dengan Residual connections, Batch Normalization dan Dropout
-    untuk klasifikasi ChestMNIST - Target val acc > 92%
+    Model CNN yang lebih dalam dengan Batch Normalization dan Dropout
+    (Model alternatif jika tidak ingin menggunakan pretrained)
     """
     def __init__(self, in_channels=1, num_classes=10):
         super().__init__()
@@ -63,7 +116,6 @@ class EfficientChestNet(nn.Module):
             nn.Linear(256, 1 if num_classes == 2 else num_classes)
         )
         
-        # Initialize weights
         self._initialize_weights()
     
     def _initialize_weights(self):
@@ -80,11 +132,11 @@ class EfficientChestNet(nn.Module):
                 nn.init.constant_(m.bias, 0)
     
     def forward(self, x):
-        x = self.conv1(x)    # (N, 64, 14, 14)
-        x = self.conv2(x)    # (N, 128, 7, 7)
-        x = self.conv3(x)    # (N, 256, 3, 3)
-        x = self.avgpool(x)  # (N, 256, 1, 1)
-        x = self.fc(x)       # (N, 1) or (N, num_classes)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.avgpool(x)
+        x = self.fc(x)
         return x
 
 
@@ -109,27 +161,39 @@ class SimpleCNN(nn.Module):
         return x
 
 
-# --- Bagian untuk pengujian ---
 if __name__ == '__main__':
     NUM_CLASSES = 2
     IN_CHANNELS = 1
     
-    print("--- Menguji Model 'EfficientChestNet' ---")
+    print("="*70)
+    print("TESTING EfficientNet-B0 for ChestMNIST")
+    print("="*70)
     
-    model = EfficientChestNet(in_channels=IN_CHANNELS, num_classes=NUM_CLASSES)
-    print("Arsitektur Model:")
+    # Test EfficientNet-B0
+    model = EfficientNetB0ChestMNIST(in_channels=IN_CHANNELS, num_classes=NUM_CLASSES, pretrained=True)
+    print("\nModel Architecture (EfficientNet-B0):")
     print(model)
     
-    dummy_input = torch.randn(64, IN_CHANNELS, 28, 28)
-    output = model(dummy_input)
+    dummy_input = torch.randn(8, IN_CHANNELS, 28, 28)
+    print(f"\nInput shape: {dummy_input.shape}")
     
-    print(f"\nUkuran input: {dummy_input.shape}")
-    print(f"Ukuran output: {output.shape}")
+    with torch.no_grad():
+        output = model(dummy_input)
     
-    # Hitung jumlah parameter
+    print(f"Output shape: {output.shape}")
+    
+    # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nTotal parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
     
-    print("\nPengujian model 'EfficientChestNet' berhasil.")
+    print(f"\n{'='*70}")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"{'='*70}")
+    
+    print("\n✓ EfficientNet-B0 model test successful!")
+    print("\nKey Features:")
+    print("- Pretrained on ImageNet")
+    print("- Modified first layer for grayscale input (1 channel)")
+    print("- Custom classifier for binary classification")
+    print("- Target: Val Acc > 90%")
