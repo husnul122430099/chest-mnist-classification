@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from datareader import get_data_loaders, NEW_CLASS_NAMES
-from model import SimpleCNN
+from model import EfficientChestNet  # Ganti dari SimpleCNN ke EfficientChestNet
 import matplotlib.pyplot as plt
 from utils import plot_training_history, visualize_random_val_predictions
 
@@ -20,7 +20,7 @@ def train():
     train_loader, val_loader, num_classes, in_channels = get_data_loaders(BATCH_SIZE)
     
     # 2. Inisialisasi Model
-    model = SimpleCNN(in_channels=in_channels, num_classes=num_classes)
+    model = EfficientChestNet(in_channels=in_channels, num_classes=num_classes)  # Gunakan model baru
     print(model)
     
     # 3. Mendefinisikan Loss Function dan Optimizer
@@ -108,4 +108,3 @@ def train():
 
 if __name__ == '__main__':
     train()
-    
