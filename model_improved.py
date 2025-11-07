@@ -1,186 +1,136 @@
+# model.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class _DenseLayer(nn.Module):
-    """Dense Layer untuk DenseNet"""
-    def __init__(self, num_input_features, growth_rate, bn_size, drop_rate):
+class ResidualBlock(nn.Module):
+    """Residual block with skip connection"""
+    def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
-        self.norm1 = nn.BatchNorm2d(num_input_features)
-        self.relu1 = nn.ReLU(inplace=True)
-        self.conv1 = nn.Conv2d(num_input_features, bn_size * growth_rate,
-                              kernel_size=1, stride=1, bias=False)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, 
+                               stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
         
-        self.norm2 = nn.BatchNorm2d(bn_size * growth_rate)
-        self.relu2 = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(bn_size * growth_rate, growth_rate,
-                              kernel_size=3, stride=1, padding=1, bias=False)
-        
-        self.drop_rate = drop_rate
-
-    def forward(self, x):
-        new_features = self.conv1(self.relu1(self.norm1(x)))
-        new_features = self.conv2(self.relu2(self.norm2(new_features)))
-        if self.drop_rate > 0:
-            new_features = F.dropout(new_features, p=self.drop_rate, training=self.training)
-        return torch.cat([x, new_features], 1)
-
-
-class _DenseBlock(nn.Module):
-    """Dense Block yang berisi beberapa Dense Layers"""
-    def __init__(self, num_layers, num_input_features, bn_size, growth_rate, drop_rate):
-        super().__init__()
-        layers = []
-        for i in range(num_layers):
-            layer = _DenseLayer(
-                num_input_features + i * growth_rate,
-                growth_rate=growth_rate,
-                bn_size=bn_size,
-                drop_rate=drop_rate
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, 
+                         stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
             )
-            layers.append(layer)
-        self.layers = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.layers(x)
-
-
-class _Transition(nn.Module):
-    """Transition layer antara Dense Blocks"""
-    def __init__(self, num_input_features, num_output_features):
-        super().__init__()
-        self.norm = nn.BatchNorm2d(num_input_features)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv = nn.Conv2d(num_input_features, num_output_features,
-                             kernel_size=1, stride=1, bias=False)
-        self.pool = nn.AvgPool2d(kernel_size=2, stride=2)
-
-    def forward(self, x):
-        x = self.conv(self.relu(self.norm(x)))
-        x = self.pool(x)
-        return x
-
-
-class DenseNet121(nn.Module):
-    """
-    DenseNet121 yang dimodifikasi untuk ChestMNIST (28x28 grayscale)
-    Target: Val Acc > 92%
     
-    Arsitektur:
-    - Growth rate: 32
-    - Block config: [6, 12, 24, 16] (DenseNet-121)
-    - Compression: 0.5
-    """
-    def __init__(self, in_channels=1, num_classes=2, growth_rate=32, 
-                 block_config=(6, 12, 24, 16), compression=0.5, drop_rate=0.2):
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+class EfficientChestNet(nn.Module):
+    def __init__(self, in_channels=1, num_classes=10):
         super().__init__()
         
-        # Initial convolution (28x28 -> 14x14)
-        num_init_features = 64
-        self.features = nn.Sequential(
-            nn.Conv2d(in_channels, num_init_features, kernel_size=3, 
-                     stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(num_init_features),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2)
+        # Initial convolution
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
         )
         
-        # Dense Blocks
-        num_features = num_init_features
-        for i, num_layers in enumerate(block_config):
-            block = _DenseBlock(
-                num_layers=num_layers,
-                num_input_features=num_features,
-                bn_size=4,
-                growth_rate=growth_rate,
-                drop_rate=drop_rate
-            )
-            self.features.add_module(f'denseblock{i+1}', block)
-            num_features = num_features + num_layers * growth_rate
-            
-            # Transition layer (kecuali setelah dense block terakhir)
-            if i != len(block_config) - 1:
-                trans = _Transition(
-                    num_input_features=num_features,
-                    num_output_features=int(num_features * compression)
-                )
-                self.features.add_module(f'transition{i+1}', trans)
-                num_features = int(num_features * compression)
+        # Residual blocks with increasing channels
+        self.layer1 = self._make_layer(64, 64, num_blocks=2, stride=1)
+        self.layer2 = self._make_layer(64, 128, num_blocks=2, stride=2)  # 28x28 -> 14x14
+        self.layer3 = self._make_layer(128, 256, num_blocks=2, stride=2)  # 14x14 -> 7x7
         
-        # Final batch norm
-        self.features.add_module('norm5', nn.BatchNorm2d(num_features))
-        self.features.add_module('relu5', nn.ReLU(inplace=True))
+        # Additional convolution block
+        self.conv_final = nn.Sequential(
+            nn.Conv2d(256, 512, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1)  # Global Average Pooling
+        )
         
-        # Global Average Pooling + Classifier
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.classifier = nn.Linear(num_features, 1 if num_classes == 2 else num_classes)
+        # Classifier with batch normalization
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 1 if num_classes == 2 else num_classes)
+        )
         
         # Initialize weights
         self._initialize_weights()
     
+    def _make_layer(self, in_channels, out_channels, num_blocks, stride):
+        layers = []
+        layers.append(ResidualBlock(in_channels, out_channels, stride))
+        for _ in range(1, num_blocks):
+            layers.append(ResidualBlock(out_channels, out_channels, stride=1))
+        return nn.Sequential(*layers)
+    
     def _initialize_weights(self):
-        """Inisialisasi weights dengan Kaiming/Xavier"""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight)
                 nn.init.constant_(m.bias, 0)
     
     def forward(self, x):
-        features = self.features(x)
-        out = self.avgpool(features)
-        out = torch.flatten(out, 1)
-        out = self.classifier(out)
-        return out
+        # Initial convolution
+        x = self.conv1(x)
+        
+        # Residual blocks
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        
+        # Final convolution and pooling
+        x = self.conv_final(x)
+        
+        # Flatten and classify
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+        return x
 
-
-class ImprovedChestNet(nn.Module):
-    """Alias untuk backward compatibility"""
-    def __init__(self, in_channels=1, num_classes=2):
-        super().__init__()
-        self.model = DenseNet121(in_channels=in_channels, num_classes=num_classes)
-    
-    def forward(self, x):
-        return self.model(x)
-
-
+# --- Bagian untuk pengujian ---
 if __name__ == '__main__':
     NUM_CLASSES = 2
     IN_CHANNELS = 1
+    BATCH_SIZE = 64
     
-    print("="*70)
-    print("TESTING DenseNet121 for ChestMNIST")
-    print("="*70)
+    print("--- Menguji Model 'EfficientChestNet' (Improved) ---")
     
-    model = DenseNet121(in_channels=IN_CHANNELS, num_classes=NUM_CLASSES)
-    print("\nModel Architecture:")
+    # Buat model
+    model = EfficientChestNet(in_channels=IN_CHANNELS, num_classes=NUM_CLASSES)
+    print("\nArsitektur Model:")
     print(model)
     
     # Test forward pass
-    dummy_input = torch.randn(8, IN_CHANNELS, 28, 28)
-    print(f"\nInput shape: {dummy_input.shape}")
+    dummy_input = torch.randn(BATCH_SIZE, IN_CHANNELS, 28, 28)
+    output = model(dummy_input)
     
-    with torch.no_grad():
-        output = model(dummy_input)
-    
-    print(f"Output shape: {output.shape}")
-    
-    # Count parameters
+    # Hitung jumlah parameter
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
-    print(f"\n{'='*70}")
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-    print(f"{'='*70}")
-    
-    print("\n✓ DenseNet121 model test successful!")
-    print("\nKey Features:")
-    print("- Growth rate: 32")
-    print("- Block config: [6, 12, 24, 16] (DenseNet-121)")
-    print("- Compression: 0.5")
-    print("- Dropout: 0.2")
-    print("- Target: Val Acc > 92%")
+    print(f"\nUkuran input: {dummy_input.shape}")
+    print(f"Ukuran output: {output.shape}")
+    print(f"Total parameter: {total_params:,}")
+    print(f"Parameter yang dapat dilatih: {trainable_params:,}")
+    print("\nPengujian model 'EfficientChestNet' (Improved) berhasil.")
