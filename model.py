@@ -1,173 +1,132 @@
 # model.py
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class DepthwiseSeparableConv(nn.Module):
-    """Depthwise Separable Convolution untuk efisiensi tinggi"""
-    def __init__(self, in_channels, out_channels, stride=1):
+# =======================
+# 🔸 Squeeze-and-Excitation Block
+# =======================
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=4):
         super().__init__()
-        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=3, 
-                                   stride=stride, padding=1, groups=in_channels, bias=False)
-        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU6(inplace=True)
-    
+        hidden_dim = max(channels // reduction, 4)
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, hidden_dim, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, channels, 1),
+            nn.Sigmoid()
+        )
     def forward(self, x):
-        x = self.depthwise(x)
-        x = self.pointwise(x)
-        x = self.bn(x)
-        x = self.relu(x)
-        return x
+        return x * self.fc(x)
 
-class InvertedResidual(nn.Module):
-    """Inverted Residual Block (MobileNetV2 style)"""
-    def __init__(self, in_channels, out_channels, stride, expand_ratio):
+# =======================
+# 🔸 Bottleneck Block (MobileNetV2 style)
+# =======================
+class Bottleneck(nn.Module):
+    def __init__(self, in_ch, out_ch, expansion=4, stride=1, use_se=True):
         super().__init__()
-        self.stride = stride
-        hidden_dim = in_channels * expand_ratio
-        self.use_res_connect = self.stride == 1 and in_channels == out_channels
-        
-        layers = []
-        if expand_ratio != 1:
-            # Expand
-            layers.extend([
-                nn.Conv2d(in_channels, hidden_dim, 1, bias=False),
-                nn.BatchNorm2d(hidden_dim),
-                nn.ReLU6(inplace=True),
-            ])
-        
-        layers.extend([
-            # Depthwise
-            nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU6(inplace=True),
-            # Project
-            nn.Conv2d(hidden_dim, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
-        ])
-        
-        self.conv = nn.Sequential(*layers)
-    
+        hidden_ch = in_ch * expansion
+        self.use_res = (in_ch == out_ch and stride == 1)
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, hidden_ch, 1, bias=False),
+            nn.BatchNorm2d(hidden_ch),
+            nn.GELU(),
+            nn.Conv2d(hidden_ch, hidden_ch, 3, stride, 1, groups=hidden_ch, bias=False),
+            nn.BatchNorm2d(hidden_ch),
+            nn.GELU(),
+            SEBlock(hidden_ch) if use_se else nn.Identity(),
+            nn.Conv2d(hidden_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch)
+        )
     def forward(self, x):
-        if self.use_res_connect:
-            return x + self.conv(x)
-        else:
-            return self.conv(x)
+        y = self.conv(x)
+        return x + y if self.use_res else y
 
+# =======================
+# 🔸 EfficientChestNet (nama diubah untuk kompatibilitas)
+# =======================
 class EfficientChestNet(nn.Module):
-    """Efficient model with MobileNetV2 architecture - Fast training & high accuracy"""
-    def __init__(self, in_channels=1, num_classes=10):
+    """Improved model with SE attention and residual bottlenecks."""
+    def __init__(self, in_channels=1, num_classes=2):
         super().__init__()
-        
-        # Initial convolution
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU6(inplace=True),
+        dims = [32, 64, 128, 256]
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, dims[0], kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(dims[0]),
+            nn.GELU()
         )
-        
-        # Inverted Residual blocks
-        # t: expansion factor, c: output channels, n: repeat, s: stride
-        inverted_residual_setting = [
-            # t, c, n, s
-            [1, 16, 1, 1],   # 28x28
-            [6, 24, 2, 2],   # 14x14
-            [6, 32, 3, 2],   # 7x7
-            [6, 64, 2, 1],   # 7x7
-        ]
-        
-        # Build inverted residual blocks
-        features = []
-        input_channel = 32
-        for t, c, n, s in inverted_residual_setting:
-            for i in range(n):
-                stride = s if i == 0 else 1
-                features.append(InvertedResidual(input_channel, c, stride, expand_ratio=t))
-                input_channel = c
-        
-        # Last convolution
-        features.append(nn.Sequential(
-            nn.Conv2d(input_channel, 128, kernel_size=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU6(inplace=True),
-        ))
-        
-        self.features = nn.Sequential(*features)
-        
-        # Global average pooling
-        self.avgpool = nn.AdaptiveAvgPool2d(1)
-        
-        # Classifier
-        self.classifier = nn.Sequential(
+
+        self.stage1 = nn.Sequential(
+            Bottleneck(dims[0], dims[0]),
+            Bottleneck(dims[0], dims[1], stride=2)
+        )
+        self.stage2 = nn.Sequential(
+            Bottleneck(dims[1], dims[1]),
+            Bottleneck(dims[1], dims[2], stride=2)
+        )
+        self.stage3 = nn.Sequential(
+            Bottleneck(dims[2], dims[2]),
+            Bottleneck(dims[2], dims[3], stride=2),
+            Bottleneck(dims[3], dims[3]),
+            SEBlock(dims[3])
+        )
+
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
             nn.Dropout(0.4),
-            nn.Linear(128, 64),
-            nn.ReLU6(inplace=True),
+            nn.Linear(dims[3], 128),
+            nn.GELU(),
             nn.Dropout(0.2),
-            nn.Linear(64, 1 if num_classes == 2 else num_classes)
+            nn.Linear(128, 1 if num_classes == 2 else num_classes)
         )
-        
-        # Initialize weights
-        self._initialize_weights()
-    
-    def _initialize_weights(self):
+
+        self._init_weights()
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.head(x)
+        return x.squeeze(1) if x.shape[1] == 1 else x
+
+    def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight)
-                nn.init.constant_(m.bias, 0)
-    
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.features(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.classifier(x)
-        return x
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
-# --- Bagian untuk pengujian ---
-if __name__ == '__main__':
-    NUM_CLASSES = 2
-    IN_CHANNELS = 1
-    BATCH_SIZE = 64
+# =======================
+# 🔸 Pengujian Cepat
+# =======================
+if __name__ == "__main__":
+    print("="*70)
+    print("Testing EfficientChestNet Model")
+    print("="*70)
     
-    print("--- Menguji Model 'EfficientChestNet' (MobileNetV2-style) ---")
-    
-    # Buat model
-    model = EfficientChestNet(in_channels=IN_CHANNELS, num_classes=NUM_CLASSES)
-    print("\nArsitektur Model:")
+    model = EfficientChestNet(in_channels=1, num_classes=2)
+    print("\nModel Architecture:")
     print(model)
     
     # Test forward pass
-    dummy_input = torch.randn(BATCH_SIZE, IN_CHANNELS, 28, 28)
-    output = model(dummy_input)
+    x = torch.randn(16, 1, 28, 28)
+    y = model(x)
     
-    # Hitung jumlah parameter
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
-    print(f"\nUkuran input: {dummy_input.shape}")
-    print(f"Ukuran output: {output.shape}")
-    print(f"Total parameter: {total_params:,}")
-    print(f"Parameter yang dapat dilatih: {trainable_params:,}")
-    
-    # Speed test
-    import time
-    model.eval()
-    with torch.no_grad():
-        start = time.time()
-        for _ in range(100):
-            _ = model(dummy_input)
-        end = time.time()
-    
-    print(f"\nInference time (100 batches): {end-start:.3f}s")
-    print(f"Average per batch: {(end-start)/100*1000:.2f}ms")
-    print("\n Pengujian model 'EfficientChestNet' (MobileNetV2-style) berhasil.")
-    print("\n Model ini 3-4x lebih cepat dari ResNet dengan akurasi setara!")
+    print(f"\nInput shape: {x.shape}")
+    print(f"Output shape: {y.shape}")
+    print(f"Total params: {total_params:,}")
+    print(f"Trainable params: {trainable_params:,}")
+    print("\n" + "="*70)
+    print("Model test completed successfully!")
+    print("="*70)
